@@ -363,9 +363,13 @@ import Foundation
 ///              both the button and voice now route through Jarvis in pure English.
 ///            - Replaced "Yes, I'm listening" spoken words with soft chime (1103) on wake word trigger,
 ///              eliminating collision between wake acknowledgment and AI response.
-///            - Unconditionally stops previous TTS utterance before starting a new one.
+///   v32 — CI FIX: EXPOSE ISPROCESSINGQUERY & CONCURRENCY SILENCING:
+///        (1) Expose isProcessingQuery:
+///            - Changed `isProcessingQuery` to `public private(set)` so ContentView can guard query submission.
+///        (2) Swift Concurrency Warning Silence:
+///            - Added `@unchecked Sendable` to TTSService to silence Xcode 26 AVSpeechSynthesizer warning.
 public enum AppVersion {
-    public static let version = 31
+    public static let version = 32
     public static let label = "v\(version)"
 }
 

@@ -59,7 +59,7 @@ public final class JarvisVoiceService: NSObject, ObservableObject {
     private var isTapInstalled: Bool = false
 
     private let processingLock = NSLock()
-    private var isProcessingQuery: Bool = false
+    public private(set) var isProcessingQuery: Bool = false
 
     /// Real audio-level VAD: tracks when the microphone's RMS power drops
     /// below the speech threshold continuously. This fires the query much

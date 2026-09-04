@@ -1,7 +1,7 @@
 import Foundation
 import AVFoundation
 
-public final class TTSService: NSObject, ObservableObject {
+public final class TTSService: NSObject, ObservableObject, @unchecked Sendable {
     public static let shared = TTSService()
 
     private let synthesizer = AVSpeechSynthesizer()
