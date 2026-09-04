@@ -353,10 +353,15 @@ import Foundation
 ///              in `recognitionTask` handler so cancelling speech recognition never triggers duplicate loop restarts.
 ///            - Audio Format Guard: checks `sampleRate > 0 && channelCount > 0` before tap installation to prevent
 ///              SIGABRT during Bluetooth audio route transitions.
-///            - Ble Flood Filter: muted high-frequency `0xB2` audio packets (50+ / sec) from `debugLog`,
-///              preventing main thread overload and UI freezing.
+///   v30 — SECURE OPEN-SOURCE RELEASE & PERSISTENT API KEY STORAGE:
+///        (1) Secure Key Management:
+///            - Removed hardcoded API keys for open-source public repository safety.
+///            - User enters OpenRouter API key in Settings; persisted securely via `@AppStorage` / `UserDefaults`.
+///            - Added voice guidance when key is not yet configured.
+///        (2) Repository Optimization:
+///            - Streamlined git repository for GitHub Actions free macOS CI runner builds.
 public enum AppVersion {
-    public static let version = 29
+    public static let version = 30
     public static let label = "v\(version)"
 }
 
