@@ -58,9 +58,8 @@ public final class TTSService: NSObject, ObservableObject {
 
         configureAudioSession()
 
-        if synthesizer.isSpeaking {
-            synthesizer.stopSpeaking(at: .immediate)
-        }
+        // Unconditionally halt previous utterance immediately to prevent voice overlapping
+        synthesizer.stopSpeaking(at: .immediate)
 
         // Clean markdown tokens (asterisks, hashtags, backticks) for fluid voice delivery
         let cleanText = text
@@ -68,6 +67,10 @@ public final class TTSService: NSObject, ObservableObject {
             .replacingOccurrences(of: "#", with: "")
             .replacingOccurrences(of: "`", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleanText.isEmpty else { return }
+
+        DebugLogger.shared.log("TTS Speaking: \"\(cleanText.prefix(40))...\"", level: .info)
 
         let utterance = AVSpeechUtterance(string: cleanText)
         // Natural English voice: prefer enhanced US English or system en-US

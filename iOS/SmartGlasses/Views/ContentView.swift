@@ -846,12 +846,12 @@ struct ContentView: View {
 
             Button(action: askAIAction) {
                 HStack(spacing: 8) {
-                    if isProcessing {
+                    if isProcessing || jarvisService.isProcessingQuery {
                         ProgressView()
                             .progressViewStyle(CircularProgressViewStyle(tint: .white))
                     } else {
                         Image(systemName: "sparkles")
-                        Text("ÎNTREABĂ ASISTENTUL AI")
+                        Text("ASK JARVIS AI")
                             .font(.system(size: 16, weight: .bold, design: .rounded))
                     }
                 }
@@ -1059,26 +1059,36 @@ struct ContentView: View {
     /// setters are nonmutating and write through to SwiftUI's storage.
     private func askAIAction() {
         HapticFeedback.medium()
-        let defaultPrompt = "Descrie ce vezi în imagine și explică ce este important."
+        if isProcessing || jarvisService.isProcessingQuery {
+            return
+        }
+
+        let defaultPrompt = "Explain what is in front of me."
+
+        // If Jarvis hands-free voice session is already active, route directly
+        // through Jarvis so voice recognition and button actions never conflict or duplicate!
+        if jarvisService.isSessionActive {
+            jarvisService.processQuestion(defaultPrompt)
+            return
+        }
+
         isProcessing = true
+        TTSService.shared.stop()
 
         if bleManager.canRequestAISnapshot {
-            messages.append(Message(isUser: true, text: "📸 Se capturează o imagine prin BLE..."))
+            messages.append(Message(isUser: true, text: "📸 Capturing POV photo from glasses..."))
             bleManager.requestAISnapshot { image, errorMessage in
                 if let image = image {
-                    self.messages.append(Message(isUser: true, text: "📷 [Imagine de la ochelari — BLE] \(defaultPrompt)", image: image))
+                    self.messages.append(Message(isUser: true, text: "📷 \(defaultPrompt)", image: image))
                     self.sendAIQuery(prompt: defaultPrompt, image: image)
                 } else {
-                    self.messages.append(Message(isUser: false, text: "⚠️ Captura BLE a eșuat: \(errorMessage ?? "motiv necunoscut"). Încerc cadrul din stream-ul RTSP..."))
+                    self.messages.append(Message(isUser: false, text: "⚠️ BLE photo capture failed: \(errorMessage ?? "unknown error"). Trying RTSP stream frame..."))
                     self.captureRTSPFrameAndQuery(prompt: defaultPrompt)
                 }
             }
         } else {
-            // Surface WHY the BLE path is unavailable instead of falling back
-            // silently — otherwise the button behaves identically to the old
-            // RTSP-only flow and the user cannot tell the difference.
-            let reason = !bleManager.isReady ? "BLE neconectat" : "Canal BLE indisponibil"
-            messages.append(Message(isUser: false, text: "ℹ️ Captura BLE indisponibilă (\(reason)). Folosesc cadrul din stream-ul RTSP, dacă există."))
+            let reason = !bleManager.isReady ? "BLE disconnected" : "BLE channel busy"
+            messages.append(Message(isUser: false, text: "ℹ️ BLE snapshot unavailable (\(reason)). Using RTSP frame if available."))
             captureRTSPFrameAndQuery(prompt: defaultPrompt)
         }
     }
@@ -1087,10 +1097,10 @@ struct ContentView: View {
     /// text-only query when the stream is not running or has stalled.
     private func captureRTSPFrameAndQuery(prompt: String) {
         if let frame = rtspClient.captureLatestFrame() {
-            messages.append(Message(isUser: true, text: "📷 [Imagine de la ochelari — RTSP] \(prompt)", image: frame))
+            messages.append(Message(isUser: true, text: "📷 [Stream RTSP] \(prompt)", image: frame))
             sendAIQuery(prompt: prompt, image: frame)
         } else {
-            messages.append(Message(isUser: false, text: "⚠️ Nu s-a putut obține nicio imagine de la ochelari (nici BLE, nici RTSP). Verificați conexiunea camerei."))
+            messages.append(Message(isUser: false, text: "⚠️ Could not obtain any image from glasses camera."))
             isProcessing = false
         }
     }
@@ -1099,6 +1109,7 @@ struct ContentView: View {
     /// the result in the chat + TTS. Resets `isProcessing` on every path.
     /// `self` is captured strongly — ContentView is a struct (see askAIAction).
     private func sendAIQuery(prompt: String, image: UIImage?) {
+        TTSService.shared.stop()
         OpenRouterService.shared.sendQuery(prompt: prompt, image: image) { result in
             DispatchQueue.main.async {
                 self.isProcessing = false
@@ -1108,7 +1119,7 @@ struct ContentView: View {
                     self.ttsService.speak(text: response)
                     HapticFeedback.success()
                 case .failure(let error):
-                    let errorMsg = "Eroare: \(error.localizedDescription)"
+                    let errorMsg = "Error: \(error.localizedDescription)"
                     self.messages.append(Message(isUser: false, text: errorMsg))
                     HapticFeedback.error()
                 }

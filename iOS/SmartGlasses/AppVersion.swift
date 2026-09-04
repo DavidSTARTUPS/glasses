@@ -357,11 +357,15 @@ import Foundation
 ///        (1) Secure Key Management:
 ///            - Removed hardcoded API keys for open-source public repository safety.
 ///            - User enters OpenRouter API key in Settings; persisted securely via `@AppStorage` / `UserDefaults`.
-///            - Added voice guidance when key is not yet configured.
-///        (2) Repository Optimization:
-///            - Streamlined git repository for GitHub Actions free macOS CI runner builds.
+///   v31 — ELIMINATE DUAL-VOICE OVERLAP & UNIFY VOICE PIPELINE:
+///        (1) Unified Single Pipeline:
+///            - Eliminated parallel Romanian defaultPrompt query from the capture button;
+///              both the button and voice now route through Jarvis in pure English.
+///            - Replaced "Yes, I'm listening" spoken words with soft chime (1103) on wake word trigger,
+///              eliminating collision between wake acknowledgment and AI response.
+///            - Unconditionally stops previous TTS utterance before starting a new one.
 public enum AppVersion {
-    public static let version = 30
+    public static let version = 31
     public static let label = "v\(version)"
 }
 

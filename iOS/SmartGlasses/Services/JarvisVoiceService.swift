@@ -399,7 +399,8 @@ public final class JarvisVoiceService: NSObject, ObservableObject {
             if isWakeWordTriggered {
                 voiceState = .recordingQuestion
                 liveTranscript = "Listening..."
-                TTSService.shared.speak(text: "Yes, I'm listening.")
+                // Play soft chime instead of speaking words to eliminate voice overlap
+                AudioServicesPlaySystemSound(1103)
                 resetSilenceTimer(duration: 3.5)
             }
             return
@@ -444,6 +445,8 @@ public final class JarvisVoiceService: NSObject, ObservableObject {
         isProcessingQuery = true
         processingLock.unlock()
 
+        // Stop any currently playing speech immediately before processing new query
+        TTSService.shared.stop()
         stopListeningLoop()
 
         DispatchQueue.main.async {
