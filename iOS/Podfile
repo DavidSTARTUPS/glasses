@@ -1,0 +1,68 @@
+platform :ios, '15.0'
+
+# Transitive dependencies of the AIBuds SDK that must be built as dynamic
+# frameworks (taken from the SDK's official example Podfile).
+dynamic_frameworks = ['AFNetworking', 'WCDB.swift', 'WCDBOptimizedSQLCipher', 'SocketRocket']
+
+pre_install do |installer|
+  installer.pod_targets.each do |pod|
+    if dynamic_frameworks.include?(pod.name)
+      def pod.static_framework?; false; end
+      def pod.build_type; Pod::BuildType.dynamic_framework; end
+    end
+  end
+end
+
+# Removes a private header import that breaks the build on newer SDKs
+# (helper taken from the SDK's official example Podfile).
+def patch_private_header(installer, pod_subdir_pairs)
+  pod_subdir_pairs.each do |pod_name, sub_dir|
+    target_dir = sub_dir ? File.join(installer.sandbox.pod_dir(pod_name), sub_dir) : installer.sandbox.pod_dir(pod_name)
+    puts target_dir
+    next unless Dir.exist?(target_dir)
+
+    private_header_import = '#import <netinet6/in6.h>'
+    Dir.glob(File.join(target_dir, '**', '*.{h,m}')).each do |file_path|
+      puts file_path
+      next unless File.exist?(file_path)
+
+      file_content = File.read(file_path)
+      next unless file_content.include?(private_header_import)
+
+      original_mode = File.stat(file_path).mode
+      File.chmod(original_mode | 0o200, file_path)
+      File.write(file_path, file_content.gsub(private_header_import, ''))
+      File.chmod(original_mode, file_path)
+      puts "patched #{pod_name} private header import: #{File.basename(file_path)}"
+    end
+  end
+end
+
+target 'SmartGlasses' do
+  use_frameworks!
+
+  # Modular installation (per the SDK documentation): only the modules the
+  # app actually needs. AllInOne was removed because it also pulls in
+  # VideoStabilization, which vendors AWEISIMG_SDK.xcframework whose
+  # ios-arm64_x86_64-simulator slice is missing in the SDK repo — that made
+  # the "[CP] Copy XCFrameworks" build phase fail with rsync status 23.
+  #
+  # ABMate     — BLE connection provider (includes AIBudsSDK/Core).
+  # LiveStream — live streaming capability (RTSP / JPEG).
+  #
+  # NOTE: currently unpinned — once you know a release tag, pin both pods:
+  #   pod 'AIBudsSDK/ABMate', :git => '...', :tag => '<tag>'
+  pod 'AIBudsSDK/ABMate', :git => 'https://github.com/topstepsmart/AIBuds-SDK-iOS.git'
+  pod 'AIBudsSDK/LiveStream', :git => 'https://github.com/topstepsmart/AIBuds-SDK-iOS.git'
+end
+
+post_install do |installer|
+  patch_private_header(installer, {'AFNetworking' => 'AFNetworking', 'Reachability' => nil })
+
+  installer.pods_project.targets.each do |target|
+    target.build_configurations.each do |config|
+      config.build_settings['BUILD_LIBRARY_FOR_DISTRIBUTION'] = 'YES'
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+  end
+end

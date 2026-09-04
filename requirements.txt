@@ -1,0 +1,13 @@
+bleak
+opencv-python
+av
+faster-whisper
+openai
+edge-tts
+sounddevice
+soundfile
+numpy
+python-dotenv
+fastapi
+uvicorn[standard]
+websockets

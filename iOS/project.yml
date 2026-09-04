@@ -1,0 +1,50 @@
+name: SmartGlasses
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  SmartGlasses:
+    type: application
+    platform: iOS
+    sources:
+      - path: SmartGlasses
+        # The entitlements file is referenced through CODE_SIGN_ENTITLEMENTS;
+        # excluding it from sources avoids copying it into the app bundle.
+        excludes:
+          - "SmartGlasses.entitlements"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.SmartGlasses
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        # Hotspot Configuration entitlement — required for
+        # NEHotspotConfigurationManager to work on device. Without it,
+        # apply() fails with NEHotspotConfigurationError code 7 ("internal").
+        # NOTE: the entitlement only takes effect when the app is signed with
+        # a provisioning profile that includes the Hotspot Configuration
+        # capability (paid Apple Developer account). Free / Sideloadly
+        # signing cannot include it; in that case join the glasses' hotspot
+        # manually via iOS Settings — the app detects it automatically.
+        CODE_SIGN_ENTITLEMENTS: SmartGlasses/SmartGlasses.entitlements
+    info:
+      path: SmartGlasses/Info.plist
+      properties:
+        UIBackgroundModes:
+          - bluetooth-central
+          - bluetooth-peripheral
+          - audio
+        NSBluetoothAlwaysUsageDescription: "Aplicația are nevoie de acces Bluetooth pentru a se conecta la ochelari."
+        NSBluetoothWhileInUseUsageDescription: "Aplicația are nevoie de acces Bluetooth în timpul utilizării pentru a comunica cu ochelarii."
+        NSMicrophoneUsageDescription: "Aplicația are nevoie de acces la microfon pentru preluarea fluxului vocal."
+        NSSpeechRecognitionUsageDescription: "Aplicația are nevoie de acces la recunoașterea vocală pentru asistentul vocal Jarvis prin căști."
+        NSCameraUsageDescription: "Aplicația are nevoie de permisiune pentru captură foto/video de pe ochelari."
+        NSLocalNetworkUsageDescription: "Aplicația are nevoie de acces la rețeaua locală pentru a prelua stream-ul RTSP prin hotspot-ul ochelarilor."
+        NSBonjourServices:
+          - _rtsp._tcp
+          - _dummy._tcp
+        UILaunchStoryboardName: LaunchScreen
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait

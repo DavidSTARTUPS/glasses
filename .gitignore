@@ -1,0 +1,34 @@
+# Aider / local tooling
+.aider*
+.env
+
+# SDK reference (local only)
+sdk_reference/
+
+# macOS
+.DS_Store
+
+# Xcode
+xcuserdata/
+DerivedData/
+build/
+*.xcuserstate
+*.xcscmblueprint
+
+# CocoaPods
+# Pods/
+# ^ Uncomment if you don't want the Pods/ checkout in git.
+# Always keep Podfile.lock committed either way.
+
+# Archives and debug symbols
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Local backups and scratch logs
+*_backup*/
+*.log
+gitlog.txt
+recent.txt
+node_modules/
+*.pcapng

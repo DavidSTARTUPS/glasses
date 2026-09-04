@@ -1,0 +1,110 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch/ref to save macOS minutes.
+concurrency:
+  group: ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA (arm64 device)
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # Current xcodegen/CocoaPods write Xcode 26 project format (77), which
+      # older Xcode versions cannot open. Select the latest stable Xcode
+      # explicitly instead of relying on the image default.
+      - name: Select latest stable Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          swift --version
+          pod --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      # ORDER IS CRITICAL: xcodegen regenerates SmartGlasses.xcodeproj from
+      # project.yml and wipes any existing CocoaPods integration. pod install
+      # must ALWAYS run after xcodegen generate, never before.
+      - name: Generate Xcode Project
+        working-directory: iOS
+        run: xcodegen generate
+
+      - name: Install CocoaPods Dependencies
+        working-directory: iOS
+        run: pod install
+
+      # Fails fast with a clear message if the workspace or scheme is broken.
+      - name: List workspace schemes
+        working-directory: iOS
+        run: xcodebuild -workspace SmartGlasses.xcworkspace -list
+
+      # Build the WORKSPACE (not the project) so the Pods targets are built
+      # and the AIBuds/ABMate frameworks resolve. Unsigned: CI has no
+      # certificates. No "clean" step: the runner is always fresh.
+      - name: Build App
+        working-directory: iOS
+        run: |
+          set -eo pipefail
+          xcodebuild build \
+            -workspace SmartGlasses.xcworkspace \
+            -scheme SmartGlasses \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=""
+
+      - name: Package into IPA
+        run: |
+          set -eo pipefail
+          rm -rf Payload SmartGlasses.ipa
+          mkdir -p Payload
+          PRODUCTS_DIR=iOS/build/Build/Products/Release-iphoneos
+          if [ ! -d "$PRODUCTS_DIR" ]; then
+            echo "Error: products directory not found: $PRODUCTS_DIR"
+            exit 1
+          fi
+          APP_PATH=$(find "$PRODUCTS_DIR" -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Error: .app file not found!"
+            exit 1
+          fi
+          APP_NAME=$(basename "$APP_PATH")
+          echo "Found app bundle at: $APP_PATH"
+          ditto "$APP_PATH" "Payload/$APP_NAME"
+          zip -qry SmartGlasses.ipa Payload
+          ls -lh SmartGlasses.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SmartGlasses-IPA
+          path: SmartGlasses.ipa
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-build-logs
+          path: iOS/build/Logs/**
+          if-no-files-found: ignore

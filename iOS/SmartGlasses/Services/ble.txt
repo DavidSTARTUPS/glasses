@@ -1,0 +1,1549 @@
+import Foundation
+import UIKit
+import CoreBluetooth
+import Combine
+import AIBuds
+import ABMate
+
+/// A peripheral seen during scanning. Listed in the manual device picker for
+/// when the automatic candidate validation cannot recognize the glasses.
+public struct DiscoveredDevice: Identifiable, Equatable {
+    public let id: UUID
+    public let name: String
+    public let rssi: Int
+
+    public init(id: UUID, name: String, rssi: Int) {
+        self.id = id
+        self.name = name
+        self.rssi = rssi
+    }
+}
+
+// MARK: - Delegate Multiplexers
+// CoreBluetooth allows only ONE delegate per peripheral / central manager.
+// After the SDK handoff the AIBuds SDK installs itself as the delegate, which
+// would silently cut BLEManager off from the notification stream — killing
+// the raw ABMate parsing (0x10 hotspot SSID, 0x12 RTSP ack, 0x02 battery)
+// while the SDK uses the same stream for its photo reassembly. The link
+// liveness monitor detects the takeover and installs these multiplexers so
+// BOTH consumers receive the callbacks. Consumers are held weakly: when the
+// SDK device is released, the multiplexer degrades gracefully to forwarding
+// to BLEManager only.
+
+/// Forwards CBPeripheralDelegate callbacks to two consumers.
+final class PeripheralDelegateMultiplexer: NSObject, CBPeripheralDelegate {
+    weak var first: CBPeripheralDelegate?
+    weak var second: CBPeripheralDelegate?
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        first?.peripheral?(peripheral, didDiscoverServices: error)
+        second?.peripheral?(peripheral, didDiscoverServices: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        first?.peripheral?(peripheral, didDiscoverCharacteristicsFor: service, error: error)
+        second?.peripheral?(peripheral, didDiscoverCharacteristicsFor: service, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        first?.peripheral?(peripheral, didUpdateValueFor: characteristic, error: error)
+        second?.peripheral?(peripheral, didUpdateValueFor: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor descriptor: CBDescriptor, error: Error?) {
+        first?.peripheral?(peripheral, didUpdateValueFor: descriptor, error: error)
+        second?.peripheral?(peripheral, didUpdateValueFor: descriptor, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        first?.peripheral?(peripheral, didUpdateNotificationStateFor: characteristic, error: error)
+        second?.peripheral?(peripheral, didUpdateNotificationStateFor: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
+        first?.peripheral?(peripheral, didWriteValueFor: characteristic, error: error)
+        second?.peripheral?(peripheral, didWriteValueFor: characteristic, error: error)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didReadRSSI RSSI: NSNumber, error: Error?) {
+        first?.peripheral?(peripheral, didReadRSSI: RSSI, error: error)
+        second?.peripheral?(peripheral, didReadRSSI: RSSI, error: error)
+    }
+
+    func peripheralDidUpdateName(_ peripheral: CBPeripheral) {
+        first?.peripheralDidUpdateName?(peripheral)
+        second?.peripheralDidUpdateName?(peripheral)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didModifyServices invalidatedServices: [CBService]) {
+        first?.peripheral?(peripheral, didModifyServices: invalidatedServices)
+        second?.peripheral?(peripheral, didModifyServices: invalidatedServices)
+    }
+}
+
+/// Forwards CBCentralManagerDelegate callbacks to two consumers.
+/// didDiscoverPeripheral is deliberately NOT forwarded: BLEManager's
+/// unfiltered scan would spam the SDK's discovery handler, and the SDK's
+/// connect flow does not need discovery callbacks for a peripheral it
+/// connected itself.
+final class CentralDelegateMultiplexer: NSObject, CBCentralManagerDelegate {
+    weak var first: CBCentralManagerDelegate?
+    weak var second: CBCentralManagerDelegate?
+
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        first?.centralManagerDidUpdateState(central)
+        second?.centralManagerDidUpdateState(central)
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        first?.centralManager?(central, didConnect: peripheral)
+        second?.centralManager?(central, didConnect: peripheral)
+    }
+
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        first?.centralManager?(central, didFailToConnect: peripheral, error: error)
+        second?.centralManager?(central, didFailToConnect: peripheral, error: error)
+    }
+
+    func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        first?.centralManager?(central, didDisconnectPeripheral: peripheral, error: error)
+        second?.centralManager?(central, didDisconnectPeripheral: peripheral, error: error)
+    }
+}
+
+public final class BLEManager: NSObject, ObservableObject {
+    public static let shared = BLEManager()
+
+    // MARK: - GATT IDs (from the ABMate SDK source: CompanionService.swift)
+    // The SDK's CompanionService defines the REAL ABMate GATT profile, and
+    // its compiled constants are: mainServiceUUID = "FDB3",
+    // mainDataWriteUuid = "FF17" (commands out), mainDataReadUuid = "FF18"
+    // (data in), ctkdUuid = "FF20" (classic-BT pairing trigger; unused here
+    // because classicBT is disabled). This MATCHES the glasses' firmware,
+    // which exposes exactly one service: FDB3. The earlier 128-bit UUIDs
+    // (B6632277-...) belong to a different protocol generation and are kept
+    // only as legacy fallbacks.
+    public static let serviceUUID = CBUUID(string: "FDB3")
+    public static let writeUUID   = CBUUID(string: "FF17")
+    public static let notifyUUID  = CBUUID(string: "FF18")
+    public static let ctkdUUID    = CBUUID(string: "FF20")
+
+    /// Fixed hotspot name requested from the glasses. Per the firmware
+    /// developer's contract (2025-09): the app chooses the AP name itself —
+    /// ASCII, at least 8 bytes ("MT5GLASSES" is 10). The name travels as the
+    /// payload of the 0x10 "hotspot on" command, so the glasses bring the AP
+    /// up under a stable, predictable name that iOS can remember and
+    /// auto-join. If the firmware ignores the payload and reports its own
+    /// name through the 0x10 notification, the reported name takes
+    /// precedence (see the 0x10 handler in didUpdateValueFor).
+    public static let preferredHotspotSSID = "MT5GLASSES"
+
+    /// Legacy 128-bit ABMate profile (older SDK documentation generation).
+    private static let legacyServiceUUID = CBUUID(string: "B6632277-0642-458B-A7A0-23FB1DC92C93")
+    private static let legacyWriteUUID   = CBUUID(string: "B6632278-0642-458B-A7A0-23FB1DC92C93")
+    private static let legacyNotifyUUID  = CBUUID(string: "B6632279-0642-458B-A7A0-23FB1DC92C93")
+
+    /// Additional known service UUIDs accepted during generic selection.
+    private static let fallbackServiceUUIDs: [CBUUID] = [legacyServiceUUID]
+
+    /// Standard GATT services that can never be the ABMate data service.
+    /// Used only as the last resort when neither the SDK's nor a legacy UUID
+    /// is present in the peripheral's service list.
+    private static let standardServiceUUIDs: Set<CBUUID> = [
+        CBUUID(string: "1800"), // Generic Access
+        CBUUID(string: "1801"), // Generic Attribute
+        CBUUID(string: "1802"), // Immediate Alert
+        CBUUID(string: "1803"), // Link Loss
+        CBUUID(string: "1804"), // Tx Power
+        CBUUID(string: "1805"), // Current Time
+        CBUUID(string: "1806"), // Reference Time Update
+        CBUUID(string: "1807"), // Next DST Change
+        CBUUID(string: "1808"), // Glucose
+        CBUUID(string: "1809"), // Health Thermometer
+        CBUUID(string: "180A"), // Device Information
+        CBUUID(string: "180D"), // Heart Rate
+        CBUUID(string: "180E"), // Phone Alert Status
+        CBUUID(string: "180F"), // Battery
+        CBUUID(string: "1811"), // Alert Notification
+        CBUUID(string: "1812"), // Human Interface Device
+        CBUUID(string: "1813"), // Scan Parameters
+        CBUUID(string: "1814"), // Running Speed and Cadence
+        CBUUID(string: "1815"), // Automation IO
+        CBUUID(string: "1816"), // Cycling Speed and Cadence
+        CBUUID(string: "1818"), // Cycling Power
+        CBUUID(string: "1819"), // Location and Navigation
+        CBUUID(string: "181A"), // Environmental Sensing
+        CBUUID(string: "181B"), // Body Composition
+        CBUUID(string: "181C"), // User Data
+        CBUUID(string: "181D"), // Weight Scale
+        CBUUID(string: "181E"), // Bond Management
+        CBUUID(string: "181F"), // Continuous Glucose
+        CBUUID(string: "1820"), // Internet Protocol Support
+        CBUUID(string: "1821"), // Indoor Positioning
+        CBUUID(string: "1822"), // Pulse Oximeter
+        CBUUID(string: "1823"), // HTTP Proxy
+        CBUUID(string: "1824"), // Transport Discovery
+        CBUUID(string: "1825")  // Object Transfer
+    ]
+
+    /// AIBuds manufacturer IDs (mirrors AIBudsFoundation.ManufacturerID / the diagnostic rig).
+    private static let knownManufacturerIDs: Set<UInt16> = [
+        0x5442, 0x5444, 0x545A, 0x4854, 0x5851, 0x5A52, 0x5A47,
+        0x0600, 0x5452, 0xC001, 0x5A43, 0x4206, 0x5A4D
+    ]
+
+    // MARK: - Connection state machine
+    public enum ConnectionState {
+        case idle          // Not trying to connect
+        case scanning      // Looking for the glasses
+        case connecting    // BLE link being established
+        case discovering   // Services / characteristics / notifications
+        case ready         // Ready to send ABMate commands
+        case reconnecting  // Waiting to retry after a loss
+    }
+
+    @Published public var state: ConnectionState = .idle
+    /// Legacy connection flag kept for existing UI. Prefer `isDeviceConnected`.
+    @Published public var isConnected: Bool = false
+    /// Reactive device-connection state for the UI debug banner.
+    /// Kept in sync with `isConnected` until the legacy flag is removed.
+    @Published public var isDeviceConnected: Bool = false
+    /// Reactive SDK-initialization state for the UI debug banner.
+    /// Set from the app's startup path via `setSDKInitialized(_:)`.
+    @Published public var isSDKInitialized: Bool = false
+    @Published public var isReady: Bool = false
+    @Published public var hotspotSSID: String = ""
+    @Published public var batteryLevel: Int = 0
+    @Published public var statusMessage: String = "Deconectat"
+    /// Every peripheral seen during the current scan session, for the manual
+    /// device picker (strongest signal first).
+    @Published public var discoveredPeripherals: [DiscoveredDevice] = []
+    /// When false, the app never connects automatically; the user picks the
+    /// glasses from `discoveredPeripherals` in the manual device picker.
+    @Published public var isAutoConnectEnabled: Bool = true
+    /// When true (default), the connected peripheral is handed to the AIBuds
+    /// SDK at ready (`makeStorableDeviceFromDiscovered` + `connect`), which
+    /// runs the SDK's ready handshake and enables the BLE AI snapshot path
+    /// (SNAP badge). The SDK's GATT profile (FDB3/FF17/FF18) matches this
+    /// firmware, so the handshake can complete. Disable in Settings if the
+    /// raw ABMate flow becomes unstable after the handoff.
+    @Published public var isSDKHandoffEnabled: Bool = true
+    /// When true, the SDK handoff enables the classic Bluetooth (SPP) profile
+    /// in ConnectParams. Firmware developer hint: the hotspot's lifetime is
+    /// tied to "the BLE/SPP connection" — if the AP keeps dying seconds after
+    /// the phone associates while BLE notifications keep flowing, classic
+    /// Bluetooth may be what holds the media session on the reference
+    /// implementation. Default false (BLE-only handshake, current behavior).
+    /// Takes effect on the NEXT connect (the handshake runs once per link).
+    @Published public var isClassicBTEnabled: Bool = false
+
+    // MARK: - Tuning
+    private let scanTimeout: TimeInterval = 12.0
+    private let connectTimeout: TimeInterval = 15.0
+    private let maxReconnectAttempts = 8
+    private let reconnectBaseDelay: TimeInterval = 1.5
+    private let maxReconnectDelay: TimeInterval = 8.0
+    private let hotspotWatchdogDelay: TimeInterval = 8.0
+    // 5 attempts: transient failures (hotspot still booting, network not yet
+    // visible) need room, while permanent permission errors (codes 7/8)
+    // bypass this budget entirely — see connectGlassesWiFi.
+    private let maxHotspotRetries = 5
+    /// How often the link-liveness monitor reconciles the published
+    /// connection flags with the REAL CoreBluetooth peripheral state, and
+    /// installs the delegate multiplexers after an SDK takeover.
+    private let linkLivenessInterval: TimeInterval = 2.0
+    /// How long after the SDK handoff to wait for `deviceDidReady` before
+    /// logging the pointed "handshake stalled" diagnostic.
+    private let sdkHandshakeWatchdogDelay: TimeInterval = 10.0
+
+    // MARK: - Core Bluetooth
+    private var centralManager: CBCentralManager!
+    private var peripheral: CBPeripheral?
+    private var writeCharacteristic: CBCharacteristic?
+    private var notifyCharacteristic: CBCharacteristic?
+    /// The service selected as the ABMate data service during discovery.
+    /// Selected generically (SDK UUID FDB3 -> legacy 128-bit -> first
+    /// non-standard service); characteristics are picked from it by
+    /// PROPERTIES (with UUID preference), not by hardcoded UUIDs alone.
+    private var targetService: CBService?
+    private var seqNum: UInt8 = 0
+
+    // MARK: - Reconnect / media pipeline bookkeeping
+    private var isManualDisconnect = false
+    private var reconnectAttempts = 0
+    private var scanTimeoutWorkItem: DispatchWorkItem?
+    private var connectTimeoutWorkItem: DispatchWorkItem?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var hotspotWatchdogWorkItem: DispatchWorkItem?
+    private var hotspotRequested = false
+    private var rtspConfirmed = false
+    private var hotspotRetryCount = 0
+    /// CBPeripherals backing the manual picker entries, keyed by identifier.
+    private var discoveredPeripheralMap: [UUID: CBPeripheral] = [:]
+    /// Last advertisement data seen for each discovered peripheral. Needed by
+    /// `AIBudsSDK.makeStorableDeviceFromDiscovered` when the connected
+    /// peripheral is handed to the SDK: the ABMate provider validates the
+    /// device from its advertisement.
+    private var discoveredAdvertisementMap: [UUID: [String: Any]] = [:]
+    /// Last RSSI seen for each discovered peripheral (paired with the map above).
+    private var discoveredRSSIMap: [UUID: NSNumber] = [:]
+    /// Peripherals that connected successfully but exposed NO usable data
+    /// service (no notifiable characteristic anywhere). They are excluded
+    /// from auto-connect candidate validation for the session so a same-named
+    /// lookalike device cannot trap the app in an endless connect -> no
+    /// service -> reconnect loop. An explicit user retry (startConnectionFlow)
+    /// clears the list, and a peripheral that advertises a known ABMate
+    /// service UUID is always accepted regardless.
+    private var servicelessPeripheralIDs: Set<UUID> = []
+    /// True while the app is deliberately dropping a peripheral that lacked
+    /// a usable data service; didDisconnectPeripheral uses it to keep the
+    /// informative status message instead of "connection lost".
+    private var isSkippingServicelessPeripheral = false
+    /// Password used for the glasses' hotspot (default 12345678, overridable
+    /// through the manual Wi-Fi sheet).
+    private var manualWiFiPassword = "12345678"
+    /// Timestamp of the last RTSP start command, used to debounce the multiple
+    /// triggers that can request the stream (Wi-Fi connectivity sink, device
+    /// ready callback, Wi-Fi join completion, manual Settings button).
+    private var lastRTSPRequestAt: Date?
+    /// Subscription to HotspotManager connectivity changes.
+    private var wifiCancellable: AnyCancellable?
+    /// The AIBuds SDK device reported through `deviceDidReady` (registered by
+    /// AppSDKDelegate in SmartGlassesApp). Required to call the SDK's feature
+    /// APIs — `DeviceCameraAPI.requestPhotoTaking(withCaptureMode: .ai)` for
+    /// the BLE photo snapshot that needs no Wi-Fi / hotspot entitlement.
+    private var sdkDevice: DeviceConvertible?
+    /// Guards the ready sequence (flags + media pipeline + handoff) so the
+    /// SDK's own re-subscription of the notify characteristic — forwarded
+    /// back to us through the delegate multiplexer — cannot re-trigger it.
+    private var hasCompletedReadySequence = false
+
+    // MARK: - Link liveness bookkeeping
+    /// Repeating reconciliation timer (see `startLinkLivenessMonitor`).
+    private var linkLivenessTimer: DispatchSourceTimer?
+    /// Installed multiplexers (see reconcileDelegates). The central one stays
+    /// installed for the manager's lifetime; the peripheral one is reset on
+    /// every new link (didConnect reassigns the delegate to BLEManager).
+    private var peripheralMultiplexer: PeripheralDelegateMultiplexer?
+    private var centralMultiplexer: CentralDelegateMultiplexer?
+
+    override init() {
+        super.init()
+        centralManager = CBCentralManager(delegate: self, queue: .main)
+
+        // React to Wi-Fi connectivity no matter HOW it was established
+        // (NEHotspotConfiguration, the in-app manual sheet, or a manual join
+        // through iOS Settings): as soon as the glasses' network becomes
+        // reachable and the device is ready, start the RTSP stream. This is
+        // what keeps the pipeline working when NEHotspotConfiguration cannot
+        // (missing Hotspot Configuration entitlement) and the user joins the
+        // hotspot from the iOS Settings app instead.
+        wifiCancellable = HotspotManager.shared.$isConnectedToWiFi
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] connected in
+                guard let self = self, connected, self.isReady else { return }
+                self.debugLog("Wi-Fi connectivity detected — starting RTSP stream.", level: .wifi)
+                self.startRTSPStream()
+            }
+
+        // Reconcile the published connection flags with the real CoreBluetooth
+        // state every few seconds (see startLinkLivenessMonitor). This is what
+        // keeps the BLE badge truthful and both delegate consumers fed even
+        // after the SDK handoff takes over the delegates.
+        startLinkLivenessMonitor()
+    }
+
+    // MARK: - Debug logging
+
+    /// Console debug log with the `[DEBUG - BLE]` tag, mirrored into the
+    /// in-app DebugLogView so every stage is visible on-device without
+    /// Xcode attached.
+    private func debugLog(_ message: String, level: DebugLogLevel = .info) {
+        print("[DEBUG - BLE] \(message)")
+        DebugLogger.shared.log(message, level: level)
+    }
+
+    // MARK: - Public API
+
+    /// Stores the AIBuds SDK initialization result (called from the app's
+    /// startup path in SmartGlassesApp) and logs it.
+    public func setSDKInitialized(_ initialized: Bool) {
+        isSDKInitialized = initialized
+        debugLog(
+            "SDK initialization state updated: \(initialized ? "initialized" : "NOT initialized")",
+            level: initialized ? .info : .error
+        )
+    }
+
+    /// Registers the SDK device reported by the `deviceDidReady` delegate
+    /// callback (called from AppSDKDelegate in SmartGlassesApp). Pass nil to
+    /// clear the registration when the device disconnects; the stale device
+    /// is told to disconnect so the SDK's internal state resets for the next
+    /// handoff.
+    public func setSDKDevice(_ device: DeviceConvertible?) {
+        let staleDevice = sdkDevice
+        sdkDevice = device
+        if device != nil {
+            debugLog("SDK device registered (deviceDidReady) — BLE AI snapshot available.")
+        } else {
+            if let staleDevice = staleDevice {
+                // Best-effort: the underlying peripheral is usually already
+                // gone; this resets the SDK device's connection state so a
+                // later handoff can create a fresh one.
+                staleDevice.disconnect()
+            }
+            debugLog("SDK device cleared.")
+        }
+    }
+
+    /// True when the BLE AI snapshot path is usable: the raw BLE link is
+    /// ready AND the AIBuds SDK has reported a ready device. When false, the
+    /// AI button falls back to the latest RTSP frame.
+    public var canRequestAISnapshot: Bool {
+        isReady && sdkDevice != nil
+    }
+
+    // MARK: - SDK handoff (activates the BLE AI snapshot path)
+
+    /// Hands the connected peripheral to the AIBuds SDK so it can run its own
+    /// ready handshake (MTU negotiation, device info sync, authentication)
+    /// over the SAME CoreBluetooth central/peripheral the app already
+    /// connected. When the handshake completes, the SDK fires
+    /// `deviceDidReady`, BLEManager registers the device, and the BLE AI
+    /// snapshot path (`DeviceCameraAPI.requestPhotoTaking(withCaptureMode:)`)
+    /// goes live — no Wi-Fi / hotspot entitlement needed.
+    ///
+    /// Device creation tries two paths:
+    ///   1. `AIBudsSDK.makeStorableDeviceFromDiscovered` — the standard
+    ///      factory; internally validates the advertisement through
+    ///      `isKnownDevice` (manufacturer data present, >= 11 bytes, vendor
+    ///      ID whitelist, MAC unpacking with the 0xAD XOR mask).
+    ///   2. Direct construction via `ABMateSDK.shared.classForDeviceModel
+    ///      .init(peripheral:advertisementData:)` — bypasses `isKnownDevice`
+    ///      entirely (ABMate.Device implements this initializer). Used when
+    ///      custom firmware advertises manufacturer data outside the SDK's
+    ///     whitelist.
+    ///
+    /// The SDK's handshake discovers ITS OWN hardcoded GATT profile
+    /// (CompanionService: FDB3 / FF17 / FF18) — which now MATCHES this
+    /// firmware, so the handshake can complete. When the SDK replaces the
+    /// peripheral/central delegates, the liveness monitor wraps them in
+    /// multiplexers so the raw ABMate pipeline keeps receiving notifications
+    /// too.
+    private func attachSDKDevice(peripheral: CBPeripheral) {
+        guard isReady else { return }
+        guard sdkDevice == nil else {
+            debugLog("SDK handoff skipped — an SDK device is already registered.")
+            return
+        }
+        guard isSDKHandoffEnabled else {
+            debugLog("SDK handoff disabled in Settings — BLE AI snapshot stays unavailable (RTSP fallback active).")
+            return
+        }
+
+        let advertisement = discoveredAdvertisementMap[peripheral.identifier]
+        let rssi = discoveredRSSIMap[peripheral.identifier]
+
+        // Path 1: the standard factory (runs the isKnownDevice advertisement
+        // validation internally).
+        var device = AIBudsSDK.makeStorableDeviceFromDiscovered(
+            peripheral,
+            central: centralManager,
+            advertisement: advertisement,
+            rssi: rssi
+        )
+        if device != nil {
+            debugLog("SDK device created through makeStorableDeviceFromDiscovered (isKnownDevice passed).")
+        } else {
+            // Path 2 (Plan B): direct construction bypasses isKnownDevice —
+            // ABMate.Device implements init(peripheral:advertisementData:).
+            debugLog("makeStorableDeviceFromDiscovered returned nil (isKnownDevice rejected the advertisement) — trying direct construction via ABMateSDK.shared.classForDeviceModel...")
+            let deviceClass = ABMateSDK.shared.classForDeviceModel
+            device = deviceClass.init(peripheral: peripheral, advertisementData: advertisement)
+            if device != nil {
+                debugLog("SDK device created DIRECTLY via classForDeviceModel (isKnownDevice bypassed).")
+            }
+        }
+
+        guard let device = device else {
+            debugLog("SDK handoff failed: neither the factory nor the direct ABMate.Device initializer could create a device for this peripheral.", level: .error)
+            return
+        }
+
+        // Per-device callbacks (photo data, ready state) are delivered to the
+        // DeviceDelegate; AppSDKDelegate conforms to both SDKDelegate and
+        // DeviceDelegate, so the shared instance receives everything.
+        device.delegate = AppSDKDelegate.shared
+
+        let params = ConnectParams()
+        // Classic Bluetooth (SPP) is opt-in through Settings
+        // (isClassicBTEnabled). The firmware developer's hotspot contract
+        // says the AP's lifetime is tied to "the BLE/SPP connection": when
+        // the AP dies seconds after association while BLE stays up, classic
+        // Bluetooth may be what holds the media session — the toggle makes
+        // that experiment possible without a code change. Default remains
+        // off (BLE-only handshake). Empty userId/randomCode/aiAuthParams is
+        // valid — the SDK only requires them when the device's manufacturer
+        // data sets requiresSecureAuthentication (false for standard eyewear).
+        params.enableClassicBT = isClassicBTEnabled
+
+        debugLog("Handing '\(device.name)' to the AIBuds SDK (ConnectParams, classicBT \(isClassicBTEnabled ? "ON — SPP experiment" : "off")). The SDK's CompanionService profile (FDB3/FF17/FF18) matches this firmware — waiting for deviceDidReady...")
+        device.connect(params)
+
+        // Watchdog: if deviceDidReady has not fired within the window, the
+        // GATT UUID mismatch cause is RULED OUT (the profile matches). The
+        // remaining likely causes are logged for the next debugging step.
+        DispatchQueue.main.asyncAfter(deadline: .now() + sdkHandshakeWatchdogDelay) { [weak self] in
+            guard let self = self else { return }
+            guard self.sdkDevice == nil else { return } // deviceDidReady already fired
+            guard self.peripheral?.identifier == peripheral.identifier, self.isReady else { return }
+            self.debugLog("SDK handshake stalled: no deviceDidReady \(Int(self.sdkHandshakeWatchdogDelay))s after the handoff. UUID mismatch is ruled out (FDB3/FF17/FF18 match). Likely causes: (1) the SDK's connect flow does not handle an ALREADY-connected peripheral, or (2) the handshake commands were rejected by the firmware. Check for 'didFailToConnectDevice' above; the raw pipeline (hotspot/RTSP) is unaffected either way.", level: .error)
+        }
+    }
+
+    /// Requests an AI snapshot over BLE (no Wi-Fi, no Hotspot Configuration
+    /// entitlement needed):
+    ///
+    /// 1. Casts the SDK device to `DeviceCameraAPI` and sends
+    ///    `requestPhotoTaking(withCaptureMode: .ai)` (raw value 1).
+    /// 2. The glasses capture a frame, compress it to JPEG and stream it back
+    ///    fragmented over the BLE notify characteristic; the SDK reassembles
+    ///    it and delivers it through
+    ///    `device(_:didReceivePhotoDataForSceneRecognition:enhancedPhotoData:error:)`.
+    /// 3. That delegate callback stores the JPEG in `GlassesPhotoStore`,
+    ///    which completes the wait registered below.
+    ///
+    /// The completion runs exactly once on the main queue: with the snapshot
+    /// (`image` != nil), or with a user-facing `errorMessage`.
+    public func requestAISnapshot(timeout: TimeInterval = 12.0, completion: @escaping (UIImage?, String?) -> Void) {
+        guard isReady else {
+            DispatchQueue.main.async { completion(nil, "Ochelarii nu sunt conectați (BLE).") }
+            return
+        }
+        guard let device = sdkDevice else {
+            DispatchQueue.main.async { completion(nil, "Dispozitivul SDK nu este disponibil (fără deviceDidReady).") }
+            return
+        }
+        guard let cameraDevice = device as? DeviceCameraAPI else {
+            DispatchQueue.main.async { completion(nil, "API-ul camerei nu este disponibil pe acest dispozitiv.") }
+            return
+        }
+
+        debugLog("Requesting AI snapshot over BLE (CaptureMode.ai)...")
+
+        // Register the wait BEFORE sending the command so a fast photo cannot
+        // be missed. It completes exactly once: with the photo, with a
+        // delegate error, or with a timeout.
+        GlassesPhotoStore.shared.awaitNextPhoto(timeout: timeout) { image, errorMessage in
+            completion(image, errorMessage)
+        }
+
+        cameraDevice.requestPhotoTaking(withCaptureMode: .ai) { [weak self] success, statusCode, error in
+            // Do not assume the callback queue (public reference rule).
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                if success {
+                    self.debugLog("AI snapshot command acknowledged (statusCode \(statusCode?.intValue ?? 0)) — waiting for the JPEG over BLE...")
+                } else {
+                    let message = Self.snapshotFailureMessage(statusCode: statusCode, error: error)
+                    self.debugLog("AI snapshot request failed: \(message)", level: .error)
+                    // Fails the pending wait above with this message.
+                    GlassesPhotoStore.shared.reportError(message)
+                }
+            }
+        }
+    }
+
+    /// Maps a failed `requestPhotoTaking` result to a user-facing message,
+    /// including the firmware status codes documented by the SDK
+    /// (0x5001 Bad Command, 0x5002 Storage Full, 0x5004 No Data Transfer
+    /// Channel, 0x5005 Status Conflict / Device Busy).
+    ///
+    /// `error` is typed `Error?` (not `NSError?`): the SDK's
+    /// `AIBudsStatusCodeCompletionHandler` block imports its `NSError *`
+    /// parameter as `(any Error)?` in Swift, so accepting `Error?` matches
+    /// the completion's actual argument type.
+    private static func snapshotFailureMessage(statusCode: NSNumber?, error: Error?) -> String {
+        if let error = error {
+            return "Eroare BLE: \(error.localizedDescription)"
+        }
+        guard let code = statusCode?.intValue, code != 0 else {
+            return "Comanda de captură a fost refuzată de ochelari."
+        }
+        switch code {
+        case 0x5001:
+            return "Comandă neacceptată de firmware (0x5001 Bad Command)."
+        case 0x5002:
+            return "Stocarea ochelarilor este plină (0x5002 Storage Full)."
+        case 0x5004:
+            return "Canalul de transfer date nu este disponibil (0x5004)."
+        case 0x5005:
+            return "Ochelarii sunt ocupați cu altă operație (0x5005 Status Conflict) — reîncercați în câteva secunde."
+        default:
+            return "Ochelarii au refuzat captura (cod \(code))."
+        }
+    }
+
+    /// Starts (or restarts) the full connection flow: scan -> connect -> discover -> subscribe -> ready.
+    public func startConnectionFlow() {
+        isManualDisconnect = false
+        reconnectAttempts = 0
+        resetPipelineState()
+        discoveredPeripherals.removeAll()
+        discoveredPeripheralMap.removeAll()
+        // Explicit user retry: give blacklisted peripherals a fresh chance
+        // (the user may have power-cycled the glasses or switched modes).
+        if !servicelessPeripheralIDs.isEmpty {
+            debugLog("Clearing the unusable-peripheral blacklist (\(servicelessPeripheralIDs.count) entries) — explicit retry.")
+            servicelessPeripheralIDs.removeAll()
+        }
+        startScanning()
+    }
+
+    public func startScanning() {
+        guard centralManager.state == .poweredOn else {
+            statusMessage = "Bluetooth oprit"
+            debugLog("Cannot start scanning — Bluetooth is not powered on (raw state: \(centralManager.state.rawValue)).", level: .error)
+            return
+        }
+        guard state != .ready, state != .discovering, state != .connecting else { return }
+
+        state = .scanning
+        statusMessage = "Căutare ochelari..."
+        debugLog("Scan started (unfiltered, duplicates enabled, candidates validated on discovery).")
+        // Scan unfiltered with duplicate reports enabled: the manual picker
+        // then shows fresh names/RSSI, and candidates are validated on every
+        // discovery (many glasses firmwares do not advertise the service UUID).
+        centralManager.scanForPeripherals(withServices: nil, options: [CBCentralManagerScanOptionAllowDuplicatesKey: true])
+        scheduleScanTimeout()
+    }
+
+    public func stopScanning() {
+        scanTimeoutWorkItem?.cancel()
+        if centralManager.isScanning {
+            centralManager.stopScan()
+            debugLog("Scanning stopped.")
+        }
+    }
+
+    public func disconnect() {
+        isManualDisconnect = true
+        debugLog("Manual disconnect requested.")
+        cancelTimers()
+        resetPipelineState()
+        setSDKDevice(nil)
+        targetService = nil
+        hasCompletedReadySequence = false
+        if let peripheral = peripheral {
+            centralManager.cancelPeripheralConnection(peripheral)
+        }
+        state = .idle
+        isConnected = false
+        isDeviceConnected = false
+        isReady = false
+        statusMessage = "Deconectat"
+    }
+
+    /// Full media pipeline: hotspot AP -> Wi-Fi -> RTSP. Safe to call again.
+    public func establishMediaPipeline() {
+        guard isReady else {
+            statusMessage = "Ochelarii nu sunt gata (BLE)"
+            debugLog("Cannot establish media pipeline — device not ready (BLE).", level: .error)
+            return
+        }
+        resetPipelineState()
+        requestHotspotAP()
+    }
+
+    // MARK: - Manual selection (fallback when auto-discovery fails)
+
+    /// Connects to a device the user picked manually from the discovered list.
+    public func connect(to device: DiscoveredDevice) {
+        guard centralManager.state == .poweredOn else {
+            statusMessage = "Bluetooth oprit"
+            debugLog("Manual connect failed — Bluetooth is not powered on.", level: .error)
+            return
+        }
+        guard let target = discoveredPeripheralMap[device.id] else {
+            statusMessage = "Dispozitivul nu mai este disponibil. Reîncercați scanarea."
+            debugLog("Manual connect failed — peripheral \(device.id) is no longer known. Rescan and pick again.", level: .error)
+            return
+        }
+
+        isManualDisconnect = false
+        reconnectAttempts = 0
+        stopScanning()
+
+        peripheral = target
+        target.delegate = self
+        state = .connecting
+        statusMessage = "Conectare manuală la \(device.name)..."
+        debugLog("Manual connect to '\(device.name)' (\(device.id.uuidString)).")
+        scheduleConnectTimeout()
+        centralManager.connect(target, options: nil)
+    }
+
+    /// Manual Wi-Fi fallback: joins the glasses' hotspot with user-supplied
+    /// credentials when the requested SSID never comes up (or the glasses
+    /// broadcast a different name). Does not require an active BLE
+    /// connection — the RTSP stream command is sent as soon as the device
+    /// becomes ready (or can be fired manually from Settings).
+    public func connectWiFiManually(ssid: String, password: String) {
+        let trimmedSSID = ssid.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSSID.isEmpty else {
+            statusMessage = "SSID invalid"
+            debugLog("Manual Wi-Fi connect failed — empty SSID.", level: .error)
+            return
+        }
+
+        manualWiFiPassword = password.isEmpty ? "12345678" : password
+        debugLog("Manual Wi-Fi connect to '\(trimmedSSID)'.", level: .wifi)
+        rtspConfirmed = false
+        hotspotSSID = trimmedSSID
+        connectGlassesWiFi()
+    }
+
+    // MARK: - ABMate Packet Construction
+    /// Format: [cmdKey (1B) | cmdType (1B) | seqNum (1B) | frameSeqNum (1B) | totalFrames (1B) | payload]
+    private func sendABMateCommand(cmdKey: UInt8, cmdType: UInt8 = 0x01, payload: Data = Data()) {
+        guard let peripheral = peripheral, let writeChar = writeCharacteristic, peripheral.state == .connected else {
+            statusMessage = "Eroare: Ochelari neconectați"
+            debugLog("Communication error — cannot send command 0x\(String(cmdKey, radix: 16)): device not connected.", level: .error)
+            return
+        }
+
+        seqNum = seqNum &+ 1
+        var packet = Data([cmdKey, cmdType, seqNum, 0x00, 0x01])
+        packet.append(payload)
+
+        let writeType: CBCharacteristicWriteType = writeChar.properties.contains(.writeWithoutResponse) ? .withoutResponse : .withResponse
+        peripheral.writeValue(packet, for: writeChar, type: writeType)
+        debugLog("TX command 0x\(String(cmdKey, radix: 16)) type 0x\(String(cmdType, radix: 16)) seq \(seqNum).", level: .tx)
+    }
+
+    // MARK: - Glasses Commands
+    public func requestHotspotAP() {
+        guard isReady else {
+            statusMessage = "Eroare: Ochelari neconectați"
+            debugLog("Cannot request hotspot AP — device not ready.", level: .error)
+            return
+        }
+        hotspotRequested = true
+        statusMessage = "Activare Hotspot AP..."
+        // Per the firmware developer's contract (2025-09): the app chooses
+        // the AP name itself (ASCII, >= 8 bytes). The chosen name travels as
+        // the 0x10 payload — the glasses bring the hotspot up under THIS
+        // name. This is also why the old payload (0x00) never produced an
+        // SSID notification: the firmware expects the app to already know
+        // the name it requested, not to be told one.
+        let ssidPayload = Data(Self.preferredHotspotSSID.utf8)
+        sendABMateCommand(cmdKey: 0x10, cmdType: 0x01, payload: ssidPayload)
+        // The name is ours — no need to wait for an echo. Prefill it so the
+        // join can start even if the glasses never announce the SSID on FF18
+        // (a 0x10 notification that DOES carry an SSID overrides this — see
+        // the 0x10 handler in didUpdateValueFor).
+        if hotspotSSID != Self.preferredHotspotSSID {
+            hotspotSSID = Self.preferredHotspotSSID
+        }
+        debugLog("Hotspot AP requested with fixed name '\(Self.preferredHotspotSSID)' (SSID sent in the 0x10 payload).", level: .wifi)
+        armHotspotWatchdog()
+    }
+
+    public func startRTSPStream() {
+        guard isReady else {
+            statusMessage = "Eroare: Ochelari neconectați"
+            debugLog("Cannot start RTSP stream — device not ready.", level: .error)
+            return
+        }
+        // Debounce: several triggers can fire within milliseconds of each
+        // other (connectivity sink + ready callback + Wi-Fi join completion).
+        // rtspConfirmed only becomes true when the device acknowledges with
+        // 0x12, so a time-based debounce prevents duplicate 0x12 commands
+        // while keeping the manual Settings button functional.
+        if let last = lastRTSPRequestAt, Date().timeIntervalSince(last) < 5.0 {
+            // Debounced command, but make sure the local RTSP client is
+            // running anyway — start() is idempotent and its retry loop
+            // tolerates the glasses' server not being up yet.
+            RTSPClient.shared.start()
+            return
+        }
+        lastRTSPRequestAt = Date()
+        statusMessage = "Pornire stream RTSP..."
+        sendABMateCommand(cmdKey: 0x12, cmdType: 0x01, payload: Data([0x01]))
+        // Start (or keep) the local RTSP client regardless of the Wi-Fi state:
+        // it retries connecting until the glasses' RTSP server answers. This
+        // also covers the case where the phone is ALREADY joined to the
+        // glasses' hotspot while the in-app join attempt was refused by iOS
+        // (codes 7/8 on Sideloadly / entitlement-less signatures).
+        RTSPClient.shared.start()
+    }
+
+    public func startMicrophoneRecording() {
+        guard isReady else {
+            statusMessage = "Eroare: Ochelari neconectați"
+            debugLog("Cannot start microphone recording — device not ready.", level: .error)
+            return
+        }
+        statusMessage = "Pornire microfon AI..."
+        sendABMateCommand(cmdKey: 0x14, cmdType: 0x01, payload: Data([0x00]))
+    }
+
+    // MARK: - Media pipeline helpers
+
+    private func connectGlassesWiFi() {
+        let ssid = hotspotSSID
+        debugLog("Requesting Wi-Fi join for hotspot '\(ssid)'...", level: .wifi)
+        HotspotManager.shared.connectToGlassesHotspot(ssid: ssid, password: manualWiFiPassword) { [weak self] success in
+            guard let self = self else { return }
+            if success {
+                self.hotspotRetryCount = 0
+                if self.isReady {
+                    self.statusMessage = "Wi-Fi Conectat. Pornire RTSP..."
+                    self.debugLog("Wi-Fi connected to hotspot '\(ssid)'. Starting RTSP...", level: .wifi)
+                    self.startRTSPStream()
+                } else {
+                    // Manual Wi-Fi joined before BLE is ready: the RTSP start
+                    // command is sent automatically once the device becomes
+                    // ready (see didUpdateNotificationStateFor and the
+                    // connectivity sink in init).
+                    self.statusMessage = "Wi-Fi Conectat. Se așteaptă conexiunea BLE..."
+                    self.debugLog("Wi-Fi connected to hotspot '\(ssid)' — waiting for BLE readiness before starting RTSP.", level: .wifi)
+                }
+            } else if let code = HotspotManager.shared.lastJoinErrorCode,
+                      code == 7 || code == 8 {
+                // Permanent iOS permission failure (missing Hotspot
+                // Configuration entitlement on Sideloadly / CI-re-signed
+                // builds, or a denied one-time prompt). Retrying apply() can
+                // NEVER succeed, so the retry budget is preserved. The phone
+                // may ALREADY be joined to the glasses' hotspot (manual join
+                // through iOS Settings) — HotspotManager has already probed
+                // the gateway for exactly that case. Start the RTSP pipeline
+                // anyway: RTSPClient's retry loop confirms real reachability,
+                // and the connectivity monitor detects a later manual join
+                // and keeps the status up to date.
+                self.hotspotRetryCount = 0
+                self.statusMessage = "iOS nu permite configurarea Wi-Fi (code \(code)). Dacă telefonul este deja conectat la rețeaua ochelarilor, stream-ul pornește acum; altfel conectați-vă din Setări → Wi-Fi (parolă 12345678)."
+                self.debugLog("Wi-Fi join impossible (permission error code \(code)) — skipping apply() retries; starting the RTSP pipeline anyway (works when the phone is already joined).", level: .error)
+                self.startRTSPStream()
+            } else {
+                self.statusMessage = "Conectare Wi-Fi eșuată. Reîncercare..."
+                self.debugLog("Wi-Fi join failed for hotspot '\(ssid)' — retry scheduled.", level: .error)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                    self?.retryHotspotConnection()
+                }
+            }
+        }
+    }
+
+    private func retryHotspotConnection() {
+        guard isReady else { return }
+        guard hotspotRetryCount < maxHotspotRetries else {
+            statusMessage = "Pipeline media indisponibil după \(maxHotspotRetries) încercări. Conectați-vă manual din Setări iOS → Wi-Fi la '\(Self.preferredHotspotSSID)' (parolă 12345678) sau folosiți „Wi-Fi manual\" din aplicație."
+            debugLog("Media pipeline unavailable after \(maxHotspotRetries) attempts.", level: .error)
+            return
+        }
+        hotspotRetryCount += 1
+        debugLog("Hotspot retry \(hotspotRetryCount)/\(maxHotspotRetries).", level: .wifi)
+        if hotspotSSID.isEmpty {
+            // Defensive: the SSID is always prefilled by requestHotspotAP in
+            // the normal flow; an empty value here means the pipeline was
+            // reset mid-flight — re-request the AP first.
+            hotspotRequested = false
+            requestHotspotAP()
+        } else {
+            connectGlassesWiFi()
+        }
+    }
+
+    private func armHotspotWatchdog() {
+        hotspotWatchdogWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.isReady else { return }
+            // The SSID is known (the app chose it), so the watchdog no longer
+            // waits for an SSID announcement: if neither a 0x10 notification
+            // nor a successful join happened within the window, retry the
+            // JOIN directly (the AP command itself was already accepted or
+            // silently dropped — re-sending it could restart a working AP).
+            guard !HotspotManager.shared.isConnectedToWiFi else { return }
+            self.retryHotspotConnection()
+        }
+        hotspotWatchdogWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + hotspotWatchdogDelay, execute: work)
+    }
+
+    private func resetPipelineState() {
+        hotspotRequested = false
+        rtspConfirmed = false
+        hotspotRetryCount = 0
+        hotspotSSID = ""
+        lastRTSPRequestAt = nil
+        hotspotWatchdogWorkItem?.cancel()
+    }
+
+    private func cancelTimers() {
+        scanTimeoutWorkItem?.cancel()
+        connectTimeoutWorkItem?.cancel()
+        reconnectWorkItem?.cancel()
+        hotspotWatchdogWorkItem?.cancel()
+    }
+
+    // MARK: - Link liveness reconciliation
+    // The published connection flags (isConnected / isDeviceConnected / isReady)
+    // are normally driven by CBCentralManagerDelegate callbacks. After the SDK
+    // handoff, the SDK can install itself as the central's (and peripheral's)
+    // delegate — disconnect callbacks then never reach BLEManager, and the BLE
+    // badge stays green forever even though the link is gone. This monitor
+    // (a) wraps any SDK delegate takeover in multiplexers so BOTH consumers
+    // keep receiving callbacks, and (b) reconciles the flags with the REAL
+    // CBPeripheral.state every 2 seconds, following the SDK docs' golden
+    // rule: never assume device state — reconcile it through properties.
+
+    private func startLinkLivenessMonitor() {
+        guard linkLivenessTimer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + linkLivenessInterval, repeating: linkLivenessInterval)
+        timer.setEventHandler { [weak self] in
+            self?.reconcileLinkState()
+        }
+        timer.resume()
+        linkLivenessTimer = timer
+    }
+
+    private func reconcileLinkState() {
+        // 1) Delegate reconciliation: if the SDK handoff replaced the
+        //    peripheral and/or central delegates, wrap them in multiplexers
+        //    so both the SDK (photo reassembly, handshake) and BLEManager
+        //    (raw ABMate parsing) keep receiving callbacks.
+        reconcileDelegates()
+
+        // 2) Reconcile the published flags with the real peripheral state.
+        guard let currentPeripheral = peripheral else { return }
+        let linkUp = currentPeripheral.state == .connected
+
+        if !linkUp, isDeviceConnected, !isSkippingServicelessPeripheral {
+            // The BLE link is actually gone but the flags still say connected:
+            // the disconnect callback was swallowed (typically by the SDK
+            // delegate takeover). Reset everything and rebuild the connection
+            // exactly like an unexpected loss.
+            debugLog("State reconciled: the BLE link is DOWN while the UI still showed connected — the disconnect callback was missed. Resetting the connection state.", level: .error)
+            forceLinkDownCleanup()
+        } else if linkUp, !isDeviceConnected {
+            // The link came back outside our flow (e.g. the SDK auto-
+            // reconnected after a drop). Reflect reality in the UI; readiness
+            // is only granted by the notification-subscription callback, so
+            // isReady stays false until that fires for us.
+            debugLog("State reconciled: the BLE link is UP while the UI showed disconnected — updating the badge.")
+            reconnectWorkItem?.cancel()
+            isConnected = true
+            isDeviceConnected = true
+        }
+    }
+
+    /// Detects an SDK delegate takeover and installs/refreshes the
+    /// multiplexers, so neither consumer loses the callback stream.
+    private func reconcileDelegates() {
+        // Peripheral delegate.
+        if let current = peripheral?.delegate, !(current === self) {
+            if current === peripheralMultiplexer {
+                // Already multiplexed — nothing to do.
+            } else if let mux = peripheralMultiplexer {
+                // The SDK replaced our multiplexer with a new handler —
+                // re-wrap the new handler in the existing multiplexer.
+                mux.second = current
+                peripheral?.delegate = mux
+                debugLog("SDK replaced the peripheral delegate again — re-wrapped in the multiplexer.")
+            } else {
+                let mux = PeripheralDelegateMultiplexer()
+                mux.first = self
+                mux.second = current
+                peripheralMultiplexer = mux
+                peripheral?.delegate = mux
+                debugLog("SDK took over the peripheral delegate — installed a multiplexer so BOTH the SDK (photo reassembly) and the raw ABMate pipeline receive notifications.")
+            }
+        }
+
+        // Central delegate.
+        if let current = centralManager.delegate, !(current === self) {
+            if current === centralMultiplexer {
+                // Already multiplexed — nothing to do.
+            } else if let mux = centralMultiplexer {
+                mux.second = current
+                centralManager.delegate = mux
+                debugLog("SDK replaced the central delegate again — re-wrapped in the multiplexer.")
+            } else {
+                let mux = CentralDelegateMultiplexer()
+                mux.first = self
+                mux.second = current
+                centralMultiplexer = mux
+                centralManager.delegate = mux
+                debugLog("SDK took over the central delegate — installed a multiplexer (disconnect/reconnect callbacks reach both consumers).")
+            }
+        }
+    }
+
+    /// Drops all link-derived state after the liveness monitor proved the
+    /// peripheral is disconnected — the callback-driven equivalent of
+    /// didDisconnectPeripheral's cleanup.
+    private func forceLinkDownCleanup() {
+        connectTimeoutWorkItem?.cancel()
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
+        targetService = nil
+        isConnected = false
+        isDeviceConnected = false
+        isReady = false
+        hasCompletedReadySequence = false
+        setSDKDevice(nil)
+        state = .idle
+
+        if isManualDisconnect {
+            statusMessage = "Deconectat"
+            return
+        }
+
+        resetPipelineState()
+        statusMessage = "Conexiune BLE pierdută (detectat prin verificare). Reconectare..."
+        scheduleReconnect()
+    }
+
+    // MARK: - Candidate validation (mirrors the diagnostic rig)
+
+    private func isCandidateGlasses(_ peripheral: CBPeripheral, advertisementData: [String: Any]) -> Bool {
+        // 0) Skip peripherals that already connected but had NO usable data
+        //    service — otherwise a same-named lookalike traps the app in an
+        //    endless connect -> no service -> reconnect loop. Exception: a
+        //    blacklisted peripheral that NOW advertises a known ABMate service
+        //    UUID is re-accepted (e.g. the glasses rebooted into a different
+        //    mode).
+        if servicelessPeripheralIDs.contains(peripheral.identifier) {
+            let advertised = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID]) ?? []
+            let advertisesKnownService = advertised.contains(Self.serviceUUID)
+                || advertised.contains(where: { Self.fallbackServiceUUIDs.contains($0) })
+            if !advertisesKnownService {
+                return false
+            }
+            debugLog("Blacklisted peripheral \(peripheral.identifier.uuidString) now advertises a known ABMate service — re-accepting it.")
+        }
+
+        // 1) Advertised ABMate service UUID — the SDK's CompanionService
+        //    UUID (FDB3) or a legacy variant.
+        if let services = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID],
+           services.contains(Self.serviceUUID) || services.contains(where: { Self.fallbackServiceUUIDs.contains($0) }) {
+            return true
+        }
+
+        // 2) Local name keywords.
+        let name = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
+        let upper = name.uppercased()
+        if upper.contains("MT5") || upper.contains("GLASSES") || upper.contains("ABMATE") {
+            return true
+        }
+
+        // 3) Manufacturer data: known AIBuds company ID + XOR-masked MAC.
+        //    iOS layout: [companyID lo, companyID hi, payload...]
+        //    MAC[i] = payload[5 + i] ^ 0xAD  =>  data[7 + i] ^ 0xAD
+        //    (Matches the SDK's isKnownDevice unpacking: productId at [2..3],
+        //    protocolVersion at [4], MAC at [5..10] XOR 0xAD.)
+        if let man = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data, man.count >= 2 {
+            let manufacturerID = UInt16(man[0]) | (UInt16(man[1]) << 8)
+            guard Self.knownManufacturerIDs.contains(manufacturerID) else { return false }
+            if man.count >= 13 {
+                let macBytes = (0..<6).map { man[7 + $0] ^ 0xAD }
+                return macBytes.contains(where: { $0 != 0 })
+            }
+            return true
+        }
+
+        return false
+    }
+
+    /// Inserts or refreshes a discovered device (newest RSSI wins) and keeps
+    /// the list ordered by signal strength for the manual picker.
+    private func upsertDiscovered(_ device: DiscoveredDevice) {
+        if let index = discoveredPeripherals.firstIndex(where: { $0.id == device.id }) {
+            discoveredPeripherals[index] = device
+        } else {
+            discoveredPeripherals.append(device)
+        }
+        discoveredPeripherals.sort { $0.rssi > $1.rssi }
+    }
+
+    // MARK: - Timers
+
+    private func scheduleScanTimeout() {
+        scanTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.state == .scanning else { return }
+            if self.centralManager.isScanning {
+                self.centralManager.stopScan()
+            }
+            if self.isAutoConnectEnabled {
+                self.statusMessage = "Ochelari negăsiți. Reîncercare..."
+                self.debugLog("Scan timed out — no glasses found. Scheduling reconnect.", level: .error)
+                self.scheduleReconnect()
+            } else {
+                // Manual mode: stop scanning but keep the discovered list on
+                // screen so the user can pick the glasses or rescan explicitly.
+                self.statusMessage = "Scanare oprită. Selectați ochelarii din listă sau reîncercați."
+                self.debugLog("Scan timed out — manual selection mode keeps the discovered list.")
+            }
+        }
+        scanTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + scanTimeout, execute: work)
+    }
+
+    private func scheduleConnectTimeout() {
+        connectTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self, self.state == .connecting, let peripheral = self.peripheral else { return }
+            self.statusMessage = "Timeout conectare. Reîncercare..."
+            self.debugLog("Connect timeout — cancelling peripheral connection.", level: .error)
+            self.centralManager.cancelPeripheralConnection(peripheral)
+            // didFailToConnect will fire and trigger the reconnect backoff.
+        }
+        connectTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + connectTimeout, execute: work)
+    }
+
+    private func scheduleReconnect() {
+        guard !isManualDisconnect else { return }
+        guard reconnectAttempts < maxReconnectAttempts else {
+            state = .idle
+            statusMessage = "Conectare eșuată după \(maxReconnectAttempts) încercări. Verificați ochelarii."
+            debugLog("Connection failed after \(maxReconnectAttempts) attempts — giving up.", level: .error)
+            return
+        }
+        reconnectAttempts += 1
+        let delay = min(reconnectBaseDelay * Double(reconnectAttempts), maxReconnectDelay)
+        state = .reconnecting
+        statusMessage = "Reconectare în \(Int(delay))s (încercarea \(reconnectAttempts)/\(maxReconnectAttempts))..."
+        debugLog("Reconnect scheduled in \(Int(delay))s (attempt \(reconnectAttempts)/\(maxReconnectAttempts)).")
+        reconnectWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.startScanning()
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    // MARK: - Characteristic helpers
+
+    /// Human-readable property list for the discovery diagnostics.
+    private static func propertyNames(_ properties: CBCharacteristicProperties) -> String {
+        var names: [String] = []
+        if properties.contains(.broadcast) { names.append("broadcast") }
+        if properties.contains(.read) { names.append("read") }
+        if properties.contains(.writeWithoutResponse) { names.append("writeNoRsp") }
+        if properties.contains(.write) { names.append("write") }
+        if properties.contains(.notify) { names.append("notify") }
+        if properties.contains(.indicate) { names.append("indicate") }
+        return names.isEmpty ? "none" : names.joined(separator: "|")
+    }
+
+    /// Space-separated hex dump used in notification diagnostics
+    /// ("a1 b2 ..."), or "(empty)" for a zero-length payload.
+    private static func hexDescription(_ data: Data) -> String {
+        guard !data.isEmpty else { return "(empty)" }
+        return data.map { String(format: "%02x", $0) }.joined(separator: " ")
+    }
+}
+
+// MARK: - CBCentralManagerDelegate
+extension BLEManager: CBCentralManagerDelegate {
+    public func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        switch central.state {
+        case .poweredOn:
+            debugLog("Bluetooth powered on.")
+            // Resume the flow (initial scan or reconnect wait) unless the user disconnected.
+            if !isManualDisconnect, (state == .idle || state == .scanning || state == .reconnecting) {
+                startScanning()
+            }
+        case .poweredOff:
+            debugLog("Bluetooth powered off — connection lost.", level: .error)
+            cancelTimers()
+            isConnected = false
+            isDeviceConnected = false
+            isReady = false
+            hasCompletedReadySequence = false
+            setSDKDevice(nil)
+            targetService = nil
+            state = .idle
+            statusMessage = "Bluetooth este oprit"
+        case .unauthorized:
+            debugLog("Bluetooth permission denied (unauthorized). Check Info.plist usage descriptions and Settings.", level: .error)
+            cancelTimers()
+            state = .idle
+            setSDKDevice(nil)
+            targetService = nil
+            statusMessage = "Permisiune Bluetooth refuzată"
+        case .unsupported:
+            debugLog("Bluetooth unsupported on this device.", level: .error)
+            cancelTimers()
+            state = .idle
+            setSDKDevice(nil)
+            targetService = nil
+            statusMessage = "Bluetooth nesuportat pe acest dispozitiv"
+        default:
+            statusMessage = "Stare Bluetooth necunoscută"
+        }
+    }
+
+    // NOTE: the parameter is declared `rssi: NSNumber` (single identifier =
+    // external label AND internal name) so the body can reference `rssi`
+    // directly. The previous `rssi RSSI: NSNumber` form made the internal
+    // name `RSSI`, which broke the `rssi.intValue` references below.
+    public func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral, advertisementData: [String : Any], rssi: NSNumber) {
+        guard state == .scanning else { return }
+
+        // Record EVERY advertised device for the manual picker. The automatic
+        // candidate validation can miss glasses whose advertisements do not
+        // match the known name/service/manufacturer patterns — the user can
+        // then pick the glasses from this list manually.
+        let advertisedName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String) ?? peripheral.name ?? ""
+        let displayName = advertisedName.isEmpty
+            ? "Fără nume (\(peripheral.identifier.uuidString.prefix(8)))"
+            : advertisedName
+        upsertDiscovered(DiscoveredDevice(id: peripheral.identifier, name: displayName, rssi: rssi.intValue))
+        discoveredPeripheralMap[peripheral.identifier] = peripheral
+        // Advertisement + RSSI are needed later by
+        // AIBudsSDK.makeStorableDeviceFromDiscovered during the SDK handoff.
+        discoveredAdvertisementMap[peripheral.identifier] = advertisementData
+        discoveredRSSIMap[peripheral.identifier] = rssi
+
+        guard isAutoConnectEnabled else { return }
+        guard isCandidateGlasses(peripheral, advertisementData: advertisementData) else { return }
+
+        debugLog("Candidate glasses found: \(displayName) (RSSI \(rssi.intValue)). Stopping scan and connecting...")
+
+        scanTimeoutWorkItem?.cancel()
+        if central.isScanning {
+            central.stopScan()
+        }
+
+        self.peripheral = peripheral
+        peripheral.delegate = self
+        state = .connecting
+        statusMessage = "Ochelari găsiți. Conectare..."
+        scheduleConnectTimeout()
+        central.connect(peripheral, options: nil)
+    }
+
+    public func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        connectTimeoutWorkItem?.cancel()
+        reconnectAttempts = 0
+        isConnected = true
+        isDeviceConnected = true
+        state = .discovering
+        statusMessage = "Conectat la BLE. Descoperire servicii..."
+        debugLog("Connection established — discovering ALL services (ABMate match follows).")
+        // Fresh link: BLEManager owns the delegate again (any multiplexer
+        // from the previous link is uninstalled here; a new one is installed
+        // by the liveness monitor if the SDK takes over after the handoff).
+        peripheral.delegate = self
+        peripheralMultiplexer = nil
+        hasCompletedReadySequence = false
+        // Discover ALL services, not just the ABMate UUID: filtered discovery
+        // returns an empty list on some firmwares even when the service
+        // exists, and the full list is the decisive diagnostic when the
+        // glasses expose a different service UUID than expected.
+        peripheral.discoverServices(nil)
+    }
+
+    public func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        connectTimeoutWorkItem?.cancel()
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
+        targetService = nil
+        isConnected = false
+        isDeviceConnected = false
+        isReady = false
+        hasCompletedReadySequence = false
+        setSDKDevice(nil)
+        state = .idle
+        if let error = error {
+            statusMessage = "Conectare eșuată: \(error.localizedDescription)"
+            debugLog("Connection failed: \(error.localizedDescription)", level: .error)
+        } else {
+            statusMessage = "Conectare eșuată"
+            debugLog("Connection failed (no error details).", level: .error)
+        }
+        scheduleReconnect()
+    }
+
+    public func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
+        connectTimeoutWorkItem?.cancel()
+        writeCharacteristic = nil
+        notifyCharacteristic = nil
+        targetService = nil
+        isConnected = false
+        isDeviceConnected = false
+        isReady = false
+        hasCompletedReadySequence = false
+        setSDKDevice(nil)
+        state = .idle
+
+        if isSkippingServicelessPeripheral {
+            isSkippingServicelessPeripheral = false
+            debugLog("Dropped the peripheral without a usable data service — resuming the scan (blacklist active).")
+            scheduleReconnect()
+            return
+        }
+
+        if isManualDisconnect {
+            debugLog("Disconnected (manual).")
+            statusMessage = "Deconectat"
+            return
+        }
+
+        // Unexpected loss: drop app-owned media state and rebuild the whole chain.
+        resetPipelineState()
+        statusMessage = "Conexiune pierdută. Reconectare..."
+        if let error = error {
+            debugLog("Unexpected disconnect: \(error.localizedDescription) — rebuilding pipeline.", level: .error)
+        } else {
+            debugLog("Unexpected disconnect (no error details) — rebuilding pipeline.", level: .error)
+        }
+        scheduleReconnect()
+    }
+}
+
+// MARK: - CBPeripheralDelegate
+extension BLEManager: CBPeripheralDelegate {
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        if let error = error {
+            statusMessage = "Eroare descoperire servicii: \(error.localizedDescription). Reconectare..."
+            debugLog("Service discovery error: \(error.localizedDescription) — reconnecting.", level: .error)
+            scheduleReconnect()
+            return
+        }
+        let services = peripheral.services ?? []
+        let serviceUUIDs = services.map { $0.uuid.uuidString }
+        if serviceUUIDs.isEmpty {
+            debugLog("Service discovery returned NO services on '\(peripheral.name ?? "?")'.", level: .error)
+        } else {
+            debugLog("Discovered \(services.count) service(s) on '\(peripheral.name ?? "?")': \(serviceUUIDs.joined(separator: ", ")).")
+        }
+
+        // GENERIC service selection. The SDK's CompanionService profile uses
+        // the 16-bit vendor service FDB3 — which is exactly what this
+        // firmware exposes. Selection order:
+        //   1) the SDK's CompanionService UUID (FDB3),
+        //   2) a legacy ABMate UUID (128-bit generation),
+        //   3) the first non-standard service (standard GATT services such
+        //      as Battery/Device Info are excluded).
+        let target = services.first { $0.uuid == Self.serviceUUID }
+            ?? services.first { Self.fallbackServiceUUIDs.contains($0.uuid) }
+            ?? services.first { !Self.standardServiceUUIDs.contains($0.uuid) }
+
+        guard let target = target else {
+            // No service that could carry the ABMate protocol: blacklist for
+            // auto-connect, drop the link and keep scanning — the service
+            // list logged above shows exactly what the device offers.
+            servicelessPeripheralIDs.insert(peripheral.identifier)
+            statusMessage = "Niciun serviciu de date pe '\(peripheral.name ?? "dispozitiv")' — dispozitiv ignorat, scanare continuă..."
+            debugLog("No usable data service on '\(peripheral.name ?? "?")'. Services present: [\(serviceUUIDs.joined(separator: ", "))]. Blacklisted for auto-connect this session.", level: .error)
+            isSkippingServicelessPeripheral = true
+            centralManager.cancelPeripheralConnection(peripheral)
+            // didDisconnectPeripheral fires next and schedules the reconnect;
+            // the blacklist keeps auto-connect away from this peripheral.
+            return
+        }
+
+        targetService = target
+        if target.uuid == Self.serviceUUID {
+            debugLog("ABMate service (FDB3, SDK CompanionService profile) discovered — discovering ALL characteristics.")
+        } else {
+            debugLog("SDK CompanionService UUID (FDB3) not present — using service \(target.uuid.uuidString) as the data service. Discovering ALL characteristics.")
+        }
+        // Discover ALL characteristics of the target service: the write/notify
+        // pair is then selected by PROPERTIES (with UUID preference), not by
+        // hardcoded UUIDs alone.
+        peripheral.discoverCharacteristics(nil, for: target)
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService, error: Error?) {
+        if let error = error {
+            statusMessage = "Eroare descoperire caracteristici: \(error.localizedDescription). Reconectare..."
+            debugLog("Characteristic discovery error: \(error.localizedDescription) — reconnecting.", level: .error)
+            scheduleReconnect()
+            return
+        }
+        // Only the selected target service's characteristics matter.
+        guard service.uuid == targetService?.uuid else { return }
+        guard let characteristics = service.characteristics, !characteristics.isEmpty else {
+            debugLog("Service \(service.uuid.uuidString) exposed NO characteristics.", level: .error)
+            return
+        }
+
+        // Log every characteristic with its properties: this is the decisive
+        // diagnostic for firmware variants with different UUIDs.
+        let described = characteristics
+            .map { "\($0.uuid.uuidString) [\(Self.propertyNames($0.properties))]" }
+            .joined(separator: ", ")
+        debugLog("Characteristics of \(service.uuid.uuidString): \(described).")
+
+        if characteristics.contains(where: { $0.uuid == Self.ctkdUUID }) {
+            debugLog("CTKD characteristic (FF20) present — firmware supports classic-BT pairing (unused: classicBT disabled).")
+        }
+
+        // GENERIC characteristic selection. The SDK's CompanionService maps
+        // FF17 -> write (commands out) and FF18 -> notify (data in). The UUID
+        // preference is VERIFIED against the properties before being trusted,
+        // so a swapped mapping on any firmware variant self-corrects through
+        // the property fallbacks.
+        let notifiable: (CBCharacteristic) -> Bool = {
+            $0.properties.contains(.notify) || $0.properties.contains(.indicate)
+        }
+        let writable: (CBCharacteristic) -> Bool = {
+            $0.properties.contains(.write) || $0.properties.contains(.writeWithoutResponse)
+        }
+
+        let notifyChar = characteristics.first { $0.uuid == Self.notifyUUID && notifiable($0) }
+            ?? characteristics.first { $0.uuid == Self.legacyNotifyUUID && notifiable($0) }
+            ?? characteristics.first(where: notifiable)
+        let writeChar = characteristics.first { $0.uuid == Self.writeUUID && writable($0) }
+            ?? characteristics.first { $0.uuid == Self.legacyWriteUUID && writable($0) }
+            ?? characteristics.first(where: writable)
+
+        guard let notifyChar = notifyChar else {
+            // Without a notifiable characteristic the raw ABMate flow cannot
+            // work on this device.
+            servicelessPeripheralIDs.insert(peripheral.identifier)
+            statusMessage = "Serviciul \(service.uuid.uuidString) nu are caracteristică de notificare — dispozitiv ignorat, scanare continuă..."
+            debugLog("No notifiable characteristic on service \(service.uuid.uuidString) — blacklisting for auto-connect this session.", level: .error)
+            isSkippingServicelessPeripheral = true
+            targetService = nil
+            centralManager.cancelPeripheralConnection(peripheral)
+            return
+        }
+
+        notifyCharacteristic = notifyChar
+        writeCharacteristic = writeChar
+        if writeChar == nil {
+            debugLog("WARNING: no writable characteristic found on \(service.uuid.uuidString) — ABMate commands will fail until one appears.", level: .error)
+        }
+        debugLog("Selected RX \(notifyChar.uuid.uuidString) / TX \(writeChar?.uuid.uuidString ?? "NONE") — subscribing to notifications.")
+        peripheral.setNotifyValue(true, for: notifyChar)
+
+        statusMessage = "Abonare notificări..."
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        // Identity check (not UUID): the notify characteristic is selected
+        // generically and may carry any firmware-specific UUID.
+        guard characteristic === notifyCharacteristic else { return }
+        if let error = error {
+            statusMessage = "Eroare abonare notificări: \(error.localizedDescription). Reconectare..."
+            debugLog("Notification subscription error: \(error.localizedDescription) — reconnecting.", level: .error)
+            scheduleReconnect()
+            return
+        }
+        guard characteristic.isNotifying else { return }
+
+        // The SDK's own (re-)subscription of the same notify characteristic is
+        // forwarded back to us through the delegate multiplexer; the ready
+        // sequence must run exactly once per link.
+        guard !hasCompletedReadySequence else {
+            debugLog("Notification state re-confirmed (SDK re-subscribe) — ready sequence already completed.")
+            return
+        }
+        hasCompletedReadySequence = true
+
+        // Link + services + notifications: the device is fully ready.
+        reconnectAttempts = 0
+        state = .ready
+        isConnected = true
+        isDeviceConnected = true
+        isReady = true
+        statusMessage = "Gata de utilizare"
+        debugLog("Notifications subscribed — device ready. Connection fully established.")
+
+        // Automatically bring up the media pipeline (hotspot AP -> Wi-Fi -> RTSP)
+        // so snapshots can be sent to the API without manual steps.
+        if !hotspotRequested {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.requestHotspotAP()
+            }
+        } else if HotspotManager.shared.isConnectedToWiFi {
+            // Wi-Fi was already established (automatically or manually, even
+            // through iOS Settings) before BLE became ready — start the RTSP
+            // stream right away.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self?.startRTSPStream()
+            }
+        }
+
+        // Hand the connected peripheral to the AIBuds SDK (delayed so the
+        // first ABMate exchange — the 0x10 hotspot command — is not
+        // interleaved with the SDK's handshake writes). When the SDK's ready
+        // handshake completes, deviceDidReady fires and the BLE AI snapshot
+        // path goes live (SNAP badge turns green). If the SDK replaces the
+        // delegates, the liveness monitor installs multiplexers so the raw
+        // pipeline keeps working alongside it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            self?.attachSDKDevice(peripheral: peripheral)
+        }
+    }
+
+    public func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
+        if let error = error {
+            statusMessage = "Eroare notificare: \(error.localizedDescription)"
+            debugLog("Communication error on notification: \(error.localizedDescription)", level: .error)
+            return
+        }
+        // Only the ABMate notify characteristic carries command responses;
+        // ignore values from any other characteristic.
+        guard characteristic === notifyCharacteristic else { return }
+        guard let data = characteristic.value, data.count >= 5 else { return }
+
+        let cmdKey = data[0]
+        let payload = data.subdata(in: 5..<data.count)
+        debugLog("RX notification 0x\(String(cmdKey, radix: 16)) (\(data.count) bytes).", level: .rx)
+
+        switch cmdKey {
+        case 0x10: // Hotspot AP notification / response
+            hotspotWatchdogWorkItem?.cancel()
+            // Hex dump of the payload: the decisive diagnostic when a firmware
+            // variant formats the SSID differently (length prefix, status
+            // byte, non-UTF8 encoding).
+            debugLog("0x10 payload (\(payload.count) bytes): \(Self.hexDescription(payload)).", level: .rx)
+            // Strip null bytes and non-printable characters from SSID payload.
+            let rawString = String(data: payload, encoding: .utf8) ?? ""
+            let cleanedSSID = rawString.trimmingCharacters(in: CharacterSet(charactersIn: "\0 \r\n\t"))
+            if !cleanedSSID.isEmpty {
+                // The glasses announced a network name — it is authoritative
+                // (covers firmware that ignores the requested name in the
+                // 0x10 payload and picks its own).
+                if cleanedSSID != hotspotSSID {
+                    debugLog("0x10 notification reports SSID '\(cleanedSSID)' instead of the requested '\(hotspotSSID)' — using the reported name.", level: .wifi)
+                    hotspotSSID = cleanedSSID
+                }
+                self.statusMessage = "Hotspot activ: \(hotspotSSID). Conectare Wi-Fi..."
+                connectGlassesWiFi()
+            } else {
+                // Ack without an SSID payload: per the firmware contract the
+                // AP is up under the name WE set in the 0x10 payload — join
+                // it immediately instead of waiting for the watchdog.
+                if hotspotSSID.isEmpty {
+                    hotspotSSID = Self.preferredHotspotSSID
+                }
+                self.statusMessage = "Hotspot activ: \(hotspotSSID). Conectare Wi-Fi..."
+                self.debugLog("0x10 ack without SSID payload — joining the requested AP name '\(hotspotSSID)'.", level: .wifi)
+                connectGlassesWiFi()
+            }
+        case 0x12: // RTSP Stream Status Response
+            rtspConfirmed = true
+            self.statusMessage = "RTSP activ la rtsp://192.168.43.1:554/live"
+        case 0x02: // Battery status
+            if payload.count >= 3 {
+                let candidate = Int(payload[1])
+                self.batteryLevel = (candidate > 0 && candidate <= 100) ? candidate : Int(payload[0])
+            } else if let firstByte = payload.first {
+                self.batteryLevel = Int(firstByte)
+            }
+            self.batteryLevel = min(max(self.batteryLevel, 0), 100)
+        default:
+            break
+        }
+    }
+}

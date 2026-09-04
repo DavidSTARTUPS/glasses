@@ -1,0 +1,6 @@
+interface:
+  display_name: "Stream Live Media from AIBuds"
+  short_description: "Public Swift/Objective-C guide for this AIBuds feature."
+  default_prompt: "Use $stream-aibuds-live-media to help me implement stream live media from aibuds with public AIBuds APIs in my iOS app."
+policy:
+  allow_implicit_invocation: false
